@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="KubeGuardian — AI-powered EKS cluster management chat interface for DevOps engineers. Monitor, scale, and maintain Kubernetes clusters using natural language.">
+  <meta name="theme-color" content="#0a0d14">
+  <title>KubeGuardian — EKS Health & Maintenance Agent</title>
+
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+  <!-- Styles -->
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app-container">
+
+    <!-- ═══════ Header ═══════ -->
+    <header class="header" id="app-header">
+      <div class="header-left">
+        <div class="header-logo">🛡️</div>
+        <div>
+          <div class="header-title">EKS Health & Maintenance Agent</div>
+          <div class="header-subtitle">KubeGuardian</div>
+        </div>
+      </div>
+
+      <div class="cluster-status-pill" id="cluster-status-pill" title="Live cluster status — refreshes every 30s">
+        <span class="status-dot" id="status-dot"></span>
+        <span id="status-nodes">— Nodes</span>
+        <span class="status-divider"></span>
+        <span id="status-pods">— Pods</span>
+        <span class="status-divider"></span>
+        <span id="status-health">Connecting…</span>
+      </div>
+    </header>
+
+    <!-- ═══════ Chat Area ═══════ -->
+    <main class="chat-area" id="chat-area">
+
+      <!-- Welcome Screen (shown on first load) -->
+      <div class="welcome-screen" id="welcome-screen">
+        <div class="welcome-icon">🛡️</div>
+        <h1 class="welcome-title">Welcome to KubeGuardian</h1>
+        <p class="welcome-description">
+          Your AI-powered Kubernetes assistant. Ask me about cluster health, 
+          pod status, deployments, or node maintenance — in plain English.
+          All write operations require your explicit approval.
+        </p>
+        <div class="example-chips" id="example-chips">
+          <button class="example-chip" onclick="sendExamplePrompt(this)">Show cluster health overview</button>
+          <button class="example-chip" onclick="sendExamplePrompt(this)">List all pods in production</button>
+          <button class="example-chip" onclick="sendExamplePrompt(this)">Is it safe to drain a node?</button>
+          <button class="example-chip" onclick="sendExamplePrompt(this)">Show recent warning events</button>
+          <button class="example-chip" onclick="sendExamplePrompt(this)">Check all pod disruption budgets</button>
+        </div>
+      </div>
+
+      <!-- Messages will be appended here -->
+    </main>
+
+    <!-- ═══════ Input Area ═══════ -->
+    <footer class="input-area">
+      <div class="input-wrapper">
+        <input
+          type="text"
+          id="message-input"
+          placeholder="Ask about your cluster…"
+          autocomplete="off"
+          autofocus
+        >
+        <button id="send-btn" onclick="sendMessage()" title="Send message" aria-label="Send">
+          ➤
+        </button>
+      </div>
+    </footer>
+
+  </div>
+
+  <!-- App Logic -->
+  <script src="/static/app.js"></script>
+</body>
+</html>
