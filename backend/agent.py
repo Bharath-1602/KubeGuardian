@@ -4,6 +4,13 @@ backend/agent.py
 The AI brain. Connects Groq / Claude / Gemini to the MCP Server.
 Manages the conversation loop, tool calling, and pending
 approval state for write operations.
+
+FIXES APPLIED:
+1. MCP connection uses AsyncExitStack (proper persistent connection)
+2. All Groq/Claude API calls wrapped in run_in_executor (non-blocking)
+3. Tool call loop adds tool result to messages BEFORE returning approval
+4. Gemini rewritten to use google-genai SDK (current API)
+5. _mcp_connected flag added for health checks
 """
 
 from __future__ import annotations
@@ -15,9 +22,9 @@ import os
 import sys
 import time
 import uuid
+from contextlib import AsyncExitStack
 from typing import Any, Optional
 
-import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
@@ -34,16 +41,16 @@ from config.settings import (
     MCP_SERVER_URL,
     PENDING_ACTION_TIMEOUT_SECONDS,
 )
-from server.guardrails import is_write_operation, is_destructive_operation
+from server.guardrails import is_write_operation
 from server.audit_log import log_approval_given, log_approval_denied
 
 logger = logging.getLogger("kubeguardian.agent")
 
 # ──────────────────────────────────────────────
-# System prompt for the AI
+# System prompt
 # ──────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are **EKS Guardian**, an expert Kubernetes cluster management assistant. 
+SYSTEM_PROMPT = """You are **EKS Guardian**, an expert Kubernetes cluster management assistant.
 You help DevOps engineers manage and monitor their Amazon EKS clusters safely and efficiently.
 
 ## Your Identity
@@ -83,123 +90,178 @@ You help DevOps engineers manage and monitor their Amazon EKS clusters safely an
 # ──────────────────────────────────────────────
 
 EXECUTE_TOOL_MAP = {
-    "scale_deployment": "execute_scale_deployment",
-    "restart_deployment": "execute_restart_deployment",
+    "scale_deployment":    "execute_scale_deployment",
+    "restart_deployment":  "execute_restart_deployment",
     "patch_resource_labels": "execute_patch_resource",
-    "cordon_node": "execute_cordon_node",
+    "cordon_node":         "execute_cordon_node",
 }
 
 
 # ──────────────────────────────────────────────
-# MCPGroqAgent
+# Helper: build approval payload from pre-check result
 # ──────────────────────────────────────────────
+
+def _build_action_plan(tool_name: str, tool_args: dict, result_data: dict) -> dict:
+    """
+    Build the action_plan dict that gets sent to the frontend
+    approval card. Centralised here so all three providers
+    produce identical output.
+    """
+    target = (
+        result_data.get("deployment")
+        or result_data.get("resource_name")
+        or result_data.get("node_name")
+        or tool_args.get("deployment_name")
+        or tool_args.get("resource_name")
+        or tool_args.get("node_name")
+        or "Unknown"
+    )
+    current_state = (
+        f"{result_data['current_replicas']} replicas"
+        if "current_replicas" in result_data
+        else str(result_data.get("current_unschedulable", ""))
+    )
+    return {
+        "operation":       result_data.get("operation", tool_name),
+        "target":          target,
+        "namespace":       result_data.get("namespace", ""),
+        "current_state":   current_state,
+        "proposed_change": result_data.get("action_plan", ""),
+        "risk_level":      result_data.get("risk_level", "LOW"),
+        "impact":          result_data.get("impact", ""),
+        "pre_check_results": result_data.get("risks", []),
+    }
+
+
+# ══════════════════════════════════════════════
+# MCPGroqAgent
+# ══════════════════════════════════════════════
 
 class MCPGroqAgent:
     """
-    AI Agent that bridges Groq/Claude/Gemini LLM with the
+    AI Agent that bridges Groq / Claude / Gemini with the
     MCP Server for Kubernetes management.
     """
 
     def __init__(self):
-        """Initialize the agent (LLM client, MCP session placeholders)."""
         self.provider = AI_PROVIDER
         self._ai_client = None
-        self._model = None
+        self._model: str = ""
         self._init_ai_client()
 
-        # MCP session (set during connect)
+        # MCP — managed by AsyncExitStack for clean lifecycle
+        self._exit_stack = AsyncExitStack()
         self._mcp_session: Optional[ClientSession] = None
-        self._mcp_streams = None
+        self._mcp_connected: bool = False
 
-        # Conversation history (last 10 messages)
+        # Conversation history (last 10 exchanges = 20 messages)
         self.conversation_history: list[dict] = []
         self.max_history = 10
 
-        # Pending actions waiting for user approval
+        # Pending write actions awaiting user approval
         self.pending_actions: dict[str, dict] = {}
 
-        # Cached tool definitions
-        self._tools_cache: list[dict] | None = None
+        # Tool definitions fetched from MCP, converted for the AI
+        self._tools_cache: list[dict] = []
 
-    def _init_ai_client(self):
-        """Initialize the appropriate AI client based on provider setting."""
+    # ────────────── AI client init ──────────────
+
+    def _init_ai_client(self) -> None:
+        """Initialise the correct AI SDK based on AI_PROVIDER."""
         if self.provider == "groq":
             from groq import Groq
             self._ai_client = Groq(api_key=GROQ_API_KEY)
             self._model = GROQ_MODEL
-            logger.info("AI Provider: Groq (model: %s)", self._model)
+            logger.info("AI Provider: Groq  model=%s", self._model)
+
         elif self.provider == "claude":
             import anthropic
             self._ai_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
             self._model = CLAUDE_MODEL
-            logger.info("AI Provider: Claude (model: %s)", self._model)
+            logger.info("AI Provider: Claude  model=%s", self._model)
+
         elif self.provider == "gemini":
-            import google.generativeai as genai
-            genai.configure(api_key=GEMINI_API_KEY)
-            self._ai_client = genai
+            # google-genai ≥ 1.0 (pip install google-genai)
+            from google import genai as google_genai
+            self._ai_client = google_genai.Client(api_key=GEMINI_API_KEY)
             self._model = GEMINI_MODEL
-            logger.info("AI Provider: Gemini (model: %s)", self._model)
+            logger.info("AI Provider: Gemini  model=%s", self._model)
+
         else:
-            raise ValueError(f"Unknown AI provider: {self.provider}")
+            raise ValueError(f"Unknown AI_PROVIDER: '{self.provider}'. "
+                             "Must be 'groq', 'claude', or 'gemini'.")
 
-    # ────────────── MCP Connection ──────────────
+    # ────────────── MCP connection ──────────────
 
-    async def connect_mcp(self):
+    async def connect_mcp(self) -> None:
         """
-        Establish a long-lived connection to the MCP Server
-        via streamable HTTP transport.
+        Open a persistent connection to the MCP Server.
+
+        Uses AsyncExitStack so both the streamable-HTTP transport
+        and the ClientSession context managers stay alive for the
+        entire lifetime of the FastAPI application.
         """
         logger.info("Connecting to MCP Server at %s", MCP_SERVER_URL)
-        self._mcp_streams = streamablehttp_client(MCP_SERVER_URL)
-        read_stream, write_stream, _ = await self._mcp_streams.__aenter__()
-        self._mcp_session = ClientSession(read_stream, write_stream)
-        await self._mcp_session.__aenter__()
-        await self._mcp_session.initialize()
-        logger.info("Connected to MCP Server successfully")
-
-        # Cache tool definitions
-        await self._refresh_tools()
-
-    async def disconnect_mcp(self):
-        """Close the MCP session and streams."""
         try:
-            if self._mcp_session:
-                await self._mcp_session.__aexit__(None, None, None)
-            if self._mcp_streams:
-                await self._mcp_streams.__aexit__(None, None, None)
-        except Exception as e:
-            logger.warning("Error disconnecting MCP: %s", e)
+            # Enter the HTTP transport — yields (read, write, _)
+            read_stream, write_stream, _ = (
+                await self._exit_stack.enter_async_context(
+                    streamablehttp_client(MCP_SERVER_URL)
+                )
+            )
+            # Enter the MCP session
+            self._mcp_session = await self._exit_stack.enter_async_context(
+                ClientSession(read_stream, write_stream)
+            )
+            await self._mcp_session.initialize()
+            self._mcp_connected = True
+            logger.info("MCP Server connected successfully")
 
-    async def _refresh_tools(self):
-        """Fetch tool definitions from MCP and cache them."""
+            # Pull tool definitions and convert for the AI
+            await self._refresh_tools()
+
+        except Exception as exc:
+            self._mcp_connected = False
+            logger.error("MCP connection failed: %s", exc)
+            raise
+
+    async def disconnect_mcp(self) -> None:
+        """Close MCP session and HTTP transport cleanly."""
+        try:
+            await self._exit_stack.aclose()
+            self._mcp_connected = False
+            logger.info("MCP Server disconnected")
+        except Exception as exc:
+            logger.warning("Error during MCP disconnect: %s", exc)
+
+    # ────────────── Tool management ──────────────
+
+    async def _refresh_tools(self) -> None:
+        """Fetch tool list from MCP and build AI-compatible specs."""
         tools_result = await self._mcp_session.list_tools()
         self._tools_cache = self._convert_tools_for_ai(tools_result.tools)
-        logger.info("Loaded %d MCP tools", len(self._tools_cache))
+        logger.info("Loaded %d tools from MCP", len(self._tools_cache))
 
     def _convert_tools_for_ai(self, mcp_tools) -> list[dict]:
         """
-        Convert MCP tool definitions to the format expected
-        by the AI provider (OpenAI-compatible for Groq/Gemini).
+        Convert MCP Tool objects → OpenAI function-calling schema.
+        (Groq and Claude both accept this format; Gemini is converted
+        separately in _process_gemini.)
 
-        Args:
-            mcp_tools: List of MCP Tool objects.
-
-        Returns:
-            List of tool spec dicts.
+        execute_* tools are hidden from the AI — they are called
+        internally only after the user approves.
         """
-        tools = []
+        tools: list[dict] = []
         for tool in mcp_tools:
-            # Skip internal execute_ tools — they shouldn't be
-            # called directly by the AI
             if tool.name.startswith("execute_"):
                 continue
 
-            # Build parameter schema
-            properties = {}
-            required = []
+            properties: dict = {}
+            required: list[str] = []
+
             if tool.inputSchema and "properties" in tool.inputSchema:
-                for name, schema in tool.inputSchema["properties"].items():
-                    properties[name] = {
+                for param_name, schema in tool.inputSchema["properties"].items():
+                    properties[param_name] = {
                         "type": schema.get("type", "string"),
                         "description": schema.get("description", ""),
                     }
@@ -219,76 +281,96 @@ class MCPGroqAgent:
             })
         return tools
 
-    # ────────────── Conversation Management ──────────────
+    # ────────────── Conversation history ──────────────
 
-    def _add_to_history(self, role: str, content: str):
-        """Add a message to conversation history, keeping last N."""
+    def _add_to_history(self, role: str, content: str) -> None:
+        """Append a message; trim to last max_history exchanges."""
         self.conversation_history.append({"role": role, "content": content})
-        # Keep system + last N user/assistant messages
-        if len(self.conversation_history) > self.max_history * 2:
-            self.conversation_history = self.conversation_history[-(self.max_history * 2):]
+        limit = self.max_history * 2
+        if len(self.conversation_history) > limit:
+            self.conversation_history = self.conversation_history[-limit:]
 
-    # ────────────── Main Processing ──────────────
+    # ────────────── MCP tool helper ──────────────
+
+    async def _call_mcp_tool(self, tool_name: str, tool_args: dict) -> str:
+        """
+        Call an MCP tool and return the raw text result.
+        Centralised so all three provider paths use the same logic.
+        """
+        result = await self._mcp_session.call_tool(tool_name, tool_args)
+        text = ""
+        for item in result.content:
+            if hasattr(item, "text"):
+                text += item.text
+        return text
+
+    # ────────────── Main entry point ──────────────
 
     async def process_message(self, user_message: str) -> dict:
         """
-        Process a user message through the AI + MCP pipeline.
-
-        Args:
-            user_message: The user's natural language input.
+        Route a user message through the correct AI provider.
 
         Returns:
-            Dict with type ('response' or 'APPROVAL_REQUIRED'),
-            message, and optional action details.
+            {"type": "response", "message": str}
+            OR
+            {"type": "APPROVAL_REQUIRED", "action_id": str, "action_plan": dict, ...}
         """
         self._add_to_history("user", user_message)
         self.cleanup_expired_actions()
 
         try:
             if self.provider == "groq":
-                return await self._process_groq(user_message)
+                return await self._process_groq()
             elif self.provider == "claude":
-                return await self._process_claude(user_message)
+                return await self._process_claude()
             elif self.provider == "gemini":
                 return await self._process_gemini(user_message)
-        except Exception as e:
-            logger.error("process_message failed: %s", e, exc_info=True)
-            error_msg = f"❌ **Error processing your request:** {str(e)}"
-            self._add_to_history("assistant", error_msg)
-            return {"type": "response", "message": error_msg}
+        except Exception as exc:
+            logger.error("process_message failed: %s", exc, exc_info=True)
+            msg = f"❌ **Error processing your request:** {exc}"
+            self._add_to_history("assistant", msg)
+            return {"type": "response", "message": msg}
 
-    async def _process_groq(self, user_message: str) -> dict:
-        """Process via Groq API with tool calling."""
-        messages = [
+    # ══════════════════════════════════════════════
+    # GROQ provider
+    # ══════════════════════════════════════════════
+
+    async def _process_groq(self) -> dict:
+        """
+        Full Groq agentic loop.
+
+        Groq's SDK is synchronous, so every API call is wrapped in
+        asyncio.get_event_loop().run_in_executor() to avoid blocking
+        FastAPI's event loop.
+        """
+        loop = asyncio.get_event_loop()
+
+        messages: list[dict] = [
             {"role": "system", "content": SYSTEM_PROMPT},
             *self.conversation_history,
         ]
 
-        response = self._ai_client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-            tools=self._tools_cache,
-            tool_choice="auto",
-            max_tokens=4096,
+        # ── First Groq call ──
+        response = await loop.run_in_executor(
+            None,
+            lambda: self._ai_client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+                tools=self._tools_cache or None,
+                tool_choice="auto",
+                max_tokens=4096,
+            ),
         )
-
         response_message = response.choices[0].message
 
-        # If no tool calls, return direct response
+        # No tool calls — plain text answer
         if not response_message.tool_calls:
             content = response_message.content or ""
             self._add_to_history("assistant", content)
             return {"type": "response", "message": content}
 
-        # Process tool calls
-        return await self._handle_tool_calls_groq(messages, response_message)
-
-    async def _handle_tool_calls_groq(self, messages: list, response_message) -> dict:
-        """
-        Handle Groq tool calls — execute read tools directly,
-        gate write tools behind approval.
-        """
-        # Add assistant message with tool calls to conversation
+        # ── Tool call loop ──
+        # Add assistant's tool-call message to the thread
         messages.append({
             "role": "assistant",
             "content": response_message.content or "",
@@ -308,134 +390,137 @@ class MCPGroqAgent:
         for tool_call in response_message.tool_calls:
             tool_name = tool_call.function.name
             tool_args = json.loads(tool_call.function.arguments)
+            logger.info("Groq tool call: %s  args=%s", tool_name, tool_args)
 
-            logger.info("Tool call: %s(%s)", tool_name, tool_args)
+            result_text = await self._call_mcp_tool(tool_name, tool_args)
 
-            # Call the MCP tool
-            mcp_result = await self._mcp_session.call_tool(tool_name, tool_args)
-            result_text = ""
-            for content_item in mcp_result.content:
-                if hasattr(content_item, 'text'):
-                    result_text += content_item.text
-
-            # Check if this is a write operation and result contains pre_check
-            if is_write_operation(tool_name):
-                try:
-                    result_data = json.loads(result_text)
-                except json.JSONDecodeError:
-                    result_data = {}
-
-                if result_data.get("blocked"):
-                    # Guardrail blocked it — return the reason
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": result_text,
-                    })
-                    # Get AI to explain the block
-                    final = self._ai_client.chat.completions.create(
-                        model=self._model,
-                        messages=messages,
-                        max_tokens=2048,
-                    )
-                    msg = final.choices[0].message.content or ""
-                    self._add_to_history("assistant", msg)
-                    return {"type": "response", "message": msg}
-
-                if result_data.get("pre_check"):
-                    # This is a write operation needing approval
-                    action_id = str(uuid.uuid4())
-                    self.pending_actions[action_id] = {
-                        "tool_name": tool_name,
-                        "tool_args": tool_args,
-                        "pre_check_result": result_data,
-                        "timestamp": time.time(),
-                    }
-
-                    return {
-                        "type": "APPROVAL_REQUIRED",
-                        "action_id": action_id,
-                        "tool_name": tool_name,
-                        "tool_args": tool_args,
-                        "action_plan": {
-                            "operation": result_data.get("operation", tool_name),
-                            "target": result_data.get("deployment",
-                                      result_data.get("resource_name",
-                                      result_data.get("node_name", "Unknown"))),
-                            "namespace": result_data.get("namespace", ""),
-                            "current_state": (
-                                f"{result_data.get('current_replicas', 'N/A')} replicas"
-                                if "current_replicas" in result_data
-                                else str(result_data.get("current_unschedulable", ""))
-                            ),
-                            "proposed_change": result_data.get("action_plan", ""),
-                            "risk_level": result_data.get("risk_level", "LOW"),
-                            "impact": result_data.get("impact", ""),
-                            "pre_check_results": result_data.get("risks", []),
-                        },
-                    }
-
-            # Read operation or non-pre-check — feed result back to Groq
+            # ── Always add tool result to messages first ──
+            # This is critical: Groq requires every tool_call_id
+            # to have a matching tool result in the thread.
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
                 "content": result_text,
             })
 
-        # Get final response from Groq with tool results
-        final_response = self._ai_client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-            max_tokens=4096,
+            if is_write_operation(tool_name):
+                try:
+                    result_data = json.loads(result_text)
+                except json.JSONDecodeError:
+                    result_data = {}
+
+                # Guardrail blocked the operation
+                if result_data.get("blocked"):
+                    final = await loop.run_in_executor(
+                        None,
+                        lambda: self._ai_client.chat.completions.create(
+                            model=self._model,
+                            messages=messages,
+                            max_tokens=2048,
+                        ),
+                    )
+                    msg = final.choices[0].message.content or ""
+                    self._add_to_history("assistant", msg)
+                    return {"type": "response", "message": msg}
+
+                # Pre-check passed — needs user approval
+                if result_data.get("pre_check"):
+                    action_id = str(uuid.uuid4())
+                    self.pending_actions[action_id] = {
+                        "tool_name":        tool_name,
+                        "tool_args":        tool_args,
+                        "pre_check_result": result_data,
+                        "timestamp":        time.time(),
+                    }
+                    return {
+                        "type":        "APPROVAL_REQUIRED",
+                        "action_id":   action_id,
+                        "tool_name":   tool_name,
+                        "tool_args":   tool_args,
+                        "action_plan": _build_action_plan(tool_name, tool_args, result_data),
+                    }
+
+        # ── Final Groq call with all tool results ──
+        final_response = await loop.run_in_executor(
+            None,
+            lambda: self._ai_client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+                max_tokens=4096,
+            ),
         )
         content = final_response.choices[0].message.content or ""
         self._add_to_history("assistant", content)
         return {"type": "response", "message": content}
 
-    async def _process_claude(self, user_message: str) -> dict:
-        """Process via Claude API with tool calling."""
-        # Convert tools to Claude format
-        claude_tools = []
-        for tool in (self._tools_cache or []):
-            claude_tools.append({
-                "name": tool["function"]["name"],
-                "description": tool["function"]["description"],
-                "input_schema": tool["function"]["parameters"],
-            })
+    # ══════════════════════════════════════════════
+    # CLAUDE provider
+    # ══════════════════════════════════════════════
 
-        messages = []
-        for msg in self.conversation_history:
-            messages.append({"role": msg["role"], "content": msg["content"]})
+    async def _process_claude(self) -> dict:
+        """
+        Full Claude agentic loop.
 
-        response = self._ai_client.messages.create(
-            model=self._model,
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
-            tools=claude_tools,
-            messages=messages,
+        Claude's SDK is also synchronous — same run_in_executor
+        pattern used here.
+        """
+        loop = asyncio.get_event_loop()
+
+        # Convert to Claude tool format
+        claude_tools = [
+            {
+                "name":         t["function"]["name"],
+                "description":  t["function"]["description"],
+                "input_schema": t["function"]["parameters"],
+            }
+            for t in self._tools_cache
+        ]
+
+        # Build message list (exclude system — passed separately)
+        messages: list[dict] = [
+            {"role": m["role"], "content": m["content"]}
+            for m in self.conversation_history
+        ]
+
+        # ── First Claude call ──
+        response = await loop.run_in_executor(
+            None,
+            lambda: self._ai_client.messages.create(
+                model=self._model,
+                max_tokens=4096,
+                system=SYSTEM_PROMPT,
+                tools=claude_tools,
+                messages=messages,
+            ),
         )
 
-        # Check for tool use
         tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
-        if not tool_use_blocks:
-            text_content = "".join(
-                b.text for b in response.content if b.type == "text"
-            )
-            self._add_to_history("assistant", text_content)
-            return {"type": "response", "message": text_content}
 
-        # Process tool calls
+        # No tool calls
+        if not tool_use_blocks:
+            text = "".join(b.text for b in response.content if b.type == "text")
+            self._add_to_history("assistant", text)
+            return {"type": "response", "message": text}
+
+        # ── Process tool calls ──
+        # Add full assistant response (may contain text + tool_use blocks)
+        messages.append({"role": "assistant", "content": response.content})
+
+        tool_results = []
+
         for tool_block in tool_use_blocks:
             tool_name = tool_block.name
             tool_args = tool_block.input
+            logger.info("Claude tool call: %s  args=%s", tool_name, tool_args)
 
-            logger.info("Tool call (Claude): %s(%s)", tool_name, tool_args)
+            result_text = await self._call_mcp_tool(tool_name, tool_args)
 
-            mcp_result = await self._mcp_session.call_tool(tool_name, tool_args)
-            result_text = ""
-            for content_item in mcp_result.content:
-                if hasattr(content_item, 'text'):
-                    result_text += content_item.text
+            # Collect tool result (Claude batches them in one user turn)
+            tool_results.append({
+                "type":        "tool_result",
+                "tool_use_id": tool_block.id,
+                "content":     result_text,
+            })
 
             if is_write_operation(tool_name):
                 try:
@@ -444,219 +529,257 @@ class MCPGroqAgent:
                     result_data = {}
 
                 if result_data.get("blocked"):
-                    msg = f"⚠️ **Operation Blocked:** {result_data.get('reason', 'Unknown reason')}"
+                    msg = (
+                        f"⚠️ **Operation Blocked by Safety Guardrail**\n\n"
+                        f"{result_data.get('reason', 'Unknown reason')}"
+                    )
                     self._add_to_history("assistant", msg)
                     return {"type": "response", "message": msg}
 
                 if result_data.get("pre_check"):
                     action_id = str(uuid.uuid4())
                     self.pending_actions[action_id] = {
-                        "tool_name": tool_name,
-                        "tool_args": tool_args,
+                        "tool_name":        tool_name,
+                        "tool_args":        tool_args,
                         "pre_check_result": result_data,
-                        "timestamp": time.time(),
+                        "timestamp":        time.time(),
                     }
                     return {
-                        "type": "APPROVAL_REQUIRED",
-                        "action_id": action_id,
-                        "tool_name": tool_name,
-                        "tool_args": tool_args,
-                        "action_plan": {
-                            "operation": result_data.get("operation", tool_name),
-                            "target": result_data.get("deployment",
-                                      result_data.get("resource_name",
-                                      result_data.get("node_name", "Unknown"))),
-                            "namespace": result_data.get("namespace", ""),
-                            "current_state": (
-                                f"{result_data.get('current_replicas', 'N/A')} replicas"
-                                if "current_replicas" in result_data
-                                else str(result_data.get("current_unschedulable", ""))
-                            ),
-                            "proposed_change": result_data.get("action_plan", ""),
-                            "risk_level": result_data.get("risk_level", "LOW"),
-                            "impact": result_data.get("impact", ""),
-                            "pre_check_results": result_data.get("risks", []),
-                        },
+                        "type":        "APPROVAL_REQUIRED",
+                        "action_id":   action_id,
+                        "tool_name":   tool_name,
+                        "tool_args":   tool_args,
+                        "action_plan": _build_action_plan(tool_name, tool_args, result_data),
                     }
 
-            # Send tool result back to Claude
-            messages.append({"role": "assistant", "content": response.content})
-            messages.append({
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": tool_block.id,
-                    "content": result_text,
-                }],
-            })
+        # Add all tool results as a single user turn (Claude's requirement)
+        messages.append({"role": "user", "content": tool_results})
 
-        # Get final response
-        final = self._ai_client.messages.create(
-            model=self._model,
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
-            messages=messages,
+        # ── Final Claude call ──
+        final = await loop.run_in_executor(
+            None,
+            lambda: self._ai_client.messages.create(
+                model=self._model,
+                max_tokens=4096,
+                system=SYSTEM_PROMPT,
+                tools=claude_tools,
+                messages=messages,
+            ),
         )
-        text_content = "".join(
-            b.text for b in final.content if b.type == "text"
-        )
-        self._add_to_history("assistant", text_content)
-        return {"type": "response", "message": text_content}
+        text = "".join(b.text for b in final.content if b.type == "text")
+        self._add_to_history("assistant", text)
+        return {"type": "response", "message": text}
+
+    # ══════════════════════════════════════════════
+    # GEMINI provider  (google-genai ≥ 1.0)
+    # ══════════════════════════════════════════════
 
     async def _process_gemini(self, user_message: str) -> dict:
-        """Process via Gemini API with function calling."""
-        # For Gemini, we use a simpler approach: call tools manually
-        # and feed results back
-        model = self._ai_client.GenerativeModel(
-            self._model,
-            system_instruction=SYSTEM_PROMPT,
-        )
+        """
+        Full Gemini agentic loop using the google-genai SDK (≥ 1.0).
 
-        # Build Gemini tools
-        gemini_tools = []
-        for tool in (self._tools_cache or []):
-            func_decl = self._ai_client.protos.FunctionDeclaration(
-                name=tool["function"]["name"],
-                description=tool["function"]["description"],
-                parameters=self._convert_params_to_gemini(tool["function"]["parameters"]),
+        This SDK has a proper async client, so no run_in_executor needed.
+        """
+        from google.genai import types as genai_types
+
+        # Build tool declarations
+        tool_declarations = []
+        for tool in self._tools_cache:
+            params = tool["function"]["parameters"]
+            properties = {}
+            for pname, pschema in params.get("properties", {}).items():
+                raw_type = pschema.get("type", "string").upper()
+                # Map JSON Schema types to Gemini Schema types
+                type_map = {
+                    "STRING":  "STRING",
+                    "INTEGER": "INTEGER",
+                    "NUMBER":  "NUMBER",
+                    "BOOLEAN": "BOOLEAN",
+                    "OBJECT":  "OBJECT",
+                    "ARRAY":   "ARRAY",
+                }
+                gemini_type = type_map.get(raw_type, "STRING")
+                properties[pname] = genai_types.Schema(
+                    type=gemini_type,
+                    description=pschema.get("description", ""),
+                )
+
+            tool_declarations.append(
+                genai_types.FunctionDeclaration(
+                    name=tool["function"]["name"],
+                    description=tool["function"]["description"],
+                    parameters=genai_types.Schema(
+                        type="OBJECT",
+                        properties=properties,
+                        required=params.get("required", []),
+                    ),
+                )
             )
-            gemini_tools.append(func_decl)
 
-        tool_config = self._ai_client.protos.Tool(function_declarations=gemini_tools)
-
-        # Build chat history
-        history = []
-        for msg in self.conversation_history[:-1]:  # Exclude current message
-            role = "user" if msg["role"] == "user" else "model"
-            history.append({"role": role, "parts": [msg["content"]]})
-
-        chat = model.start_chat(history=history)
-        response = chat.send_message(
-            user_message,
-            tools=[tool_config],
+        gemini_tool = genai_types.Tool(function_declarations=tool_declarations)
+        config = genai_types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            tools=[gemini_tool],
         )
 
-        # Check for function calls
-        if response.candidates[0].content.parts:
-            for part in response.candidates[0].content.parts:
-                if hasattr(part, 'function_call') and part.function_call:
-                    fc = part.function_call
-                    tool_name = fc.name
-                    tool_args = dict(fc.args) if fc.args else {}
+        # Build conversation history for Gemini
+        contents: list[genai_types.Content] = []
+        for msg in self.conversation_history:
+            role = "user" if msg["role"] == "user" else "model"
+            contents.append(
+                genai_types.Content(
+                    role=role,
+                    parts=[genai_types.Part(text=msg["content"])],
+                )
+            )
 
-                    logger.info("Tool call (Gemini): %s(%s)", tool_name, tool_args)
+        # ── First Gemini call (async) ──
+        response = await self._ai_client.aio.models.generate_content(
+            model=self._model,
+            contents=contents,
+            config=config,
+        )
 
-                    mcp_result = await self._mcp_session.call_tool(tool_name, tool_args)
-                    result_text = ""
-                    for content_item in mcp_result.content:
-                        if hasattr(content_item, 'text'):
-                            result_text += content_item.text
+        # ── Tool call loop ──
+        # Gemini may request multiple rounds of function calls
+        max_rounds = 5
+        for _ in range(max_rounds):
+            # Find function call parts
+            fc_parts = [
+                p for p in (response.candidates[0].content.parts or [])
+                if p.function_call is not None
+            ]
 
-                    if is_write_operation(tool_name):
-                        try:
-                            result_data = json.loads(result_text)
-                        except json.JSONDecodeError:
-                            result_data = {}
+            if not fc_parts:
+                break  # No more tool calls — get final text
 
-                        if result_data.get("blocked"):
-                            msg = f"⚠️ **Operation Blocked:** {result_data.get('reason', 'Unknown')}"
-                            self._add_to_history("assistant", msg)
-                            return {"type": "response", "message": msg}
+            # Add model's response to contents
+            contents.append(response.candidates[0].content)
 
-                        if result_data.get("pre_check"):
-                            action_id = str(uuid.uuid4())
-                            self.pending_actions[action_id] = {
-                                "tool_name": tool_name,
-                                "tool_args": tool_args,
-                                "pre_check_result": result_data,
-                                "timestamp": time.time(),
-                            }
-                            return {
-                                "type": "APPROVAL_REQUIRED",
-                                "action_id": action_id,
-                                "tool_name": tool_name,
-                                "tool_args": tool_args,
-                                "action_plan": {
-                                    "operation": result_data.get("operation", tool_name),
-                                    "target": result_data.get("deployment",
-                                              result_data.get("resource_name",
-                                              result_data.get("node_name", "Unknown"))),
-                                    "namespace": result_data.get("namespace", ""),
-                                    "current_state": (
-                                        f"{result_data.get('current_replicas', 'N/A')} replicas"
-                                        if "current_replicas" in result_data
-                                        else str(result_data.get("current_unschedulable", ""))
-                                    ),
-                                    "proposed_change": result_data.get("action_plan", ""),
-                                    "risk_level": result_data.get("risk_level", "LOW"),
-                                    "impact": result_data.get("impact", ""),
-                                    "pre_check_results": result_data.get("risks", []),
-                                },
-                            }
+            # Execute each function call and collect responses
+            function_responses = []
+            approval_needed = None
 
-                    # Feed result back to Gemini
-                    func_response = self._ai_client.protos.Part(
-                        function_response=self._ai_client.protos.FunctionResponse(
+            for part in fc_parts:
+                fc = part.function_call
+                tool_name = fc.name
+                tool_args = dict(fc.args) if fc.args else {}
+                logger.info("Gemini tool call: %s  args=%s", tool_name, tool_args)
+
+                result_text = await self._call_mcp_tool(tool_name, tool_args)
+
+                # Always collect the function response
+                function_responses.append(
+                    genai_types.Part(
+                        function_response=genai_types.FunctionResponse(
                             name=tool_name,
                             response={"result": result_text},
                         )
                     )
-                    response = chat.send_message(func_response)
+                )
 
-        # Extract text response
-        text = response.text if hasattr(response, 'text') else str(response)
+                if is_write_operation(tool_name):
+                    try:
+                        result_data = json.loads(result_text)
+                    except json.JSONDecodeError:
+                        result_data = {}
+
+                    if result_data.get("blocked"):
+                        msg = (
+                            f"⚠️ **Operation Blocked by Safety Guardrail**\n\n"
+                            f"{result_data.get('reason', 'Unknown reason')}"
+                        )
+                        self._add_to_history("assistant", msg)
+                        return {"type": "response", "message": msg}
+
+                    if result_data.get("pre_check"):
+                        # Store approval info — we still send function
+                        # responses to Gemini but will return approval UI
+                        action_id = str(uuid.uuid4())
+                        self.pending_actions[action_id] = {
+                            "tool_name":        tool_name,
+                            "tool_args":        tool_args,
+                            "pre_check_result": result_data,
+                            "timestamp":        time.time(),
+                        }
+                        approval_needed = {
+                            "type":        "APPROVAL_REQUIRED",
+                            "action_id":   action_id,
+                            "tool_name":   tool_name,
+                            "tool_args":   tool_args,
+                            "action_plan": _build_action_plan(
+                                tool_name, tool_args, result_data
+                            ),
+                        }
+
+            # Add all function responses as a user turn
+            contents.append(
+                genai_types.Content(
+                    role="user",
+                    parts=function_responses,
+                )
+            )
+
+            # Return approval gate before next Gemini call if needed
+            if approval_needed:
+                return approval_needed
+
+            # Continue the loop with next Gemini call
+            response = await self._ai_client.aio.models.generate_content(
+                model=self._model,
+                contents=contents,
+                config=config,
+            )
+
+        # ── Extract final text ──
+        text = ""
+        for part in (response.candidates[0].content.parts or []):
+            if hasattr(part, "text") and part.text:
+                text += part.text
+
+        if not text:
+            text = "I completed the requested operations. Let me know if you need anything else."
+
         self._add_to_history("assistant", text)
         return {"type": "response", "message": text}
 
-    def _convert_params_to_gemini(self, params: dict) -> dict:
-        """Convert OpenAI-style parameters to Gemini proto format."""
-        return {
-            "type": "OBJECT",
-            "properties": {
-                name: {
-                    "type": schema.get("type", "STRING").upper(),
-                    "description": schema.get("description", ""),
-                }
-                for name, schema in params.get("properties", {}).items()
-            },
-            "required": params.get("required", []),
-        }
-
-    # ────────────── Approval Flow ──────────────
+    # ══════════════════════════════════════════════
+    # Approval flow
+    # ══════════════════════════════════════════════
 
     async def execute_approved_action(self, action_id: str) -> dict:
         """
-        Execute a previously approved write operation.
+        Execute a write operation after the user clicked Approve.
 
-        Args:
-            action_id: UUID of the pending action.
-
-        Returns:
-            Execution result dict.
+        Looks up the pending action by UUID, calls the matching
+        execute_* MCP tool, logs the outcome, and returns a
+        human-readable result.
         """
         if action_id not in self.pending_actions:
             return {
                 "type": "response",
-                "message": "❌ **Action not found.** It may have expired or already been processed.",
+                "message": (
+                    "❌ **Action not found.** "
+                    "It may have expired or already been processed."
+                ),
             }
 
         action = self.pending_actions[action_id]
 
-        # Check timeout
-        elapsed = time.time() - action["timestamp"]
-        if elapsed > PENDING_ACTION_TIMEOUT_SECONDS:
+        # Timeout guard
+        if time.time() - action["timestamp"] > PENDING_ACTION_TIMEOUT_SECONDS:
             del self.pending_actions[action_id]
             return {
                 "type": "response",
                 "message": (
-                    f"❌ **Action expired.** The approval window of "
-                    f"{PENDING_ACTION_TIMEOUT_SECONDS} seconds has passed. "
+                    f"❌ **Action expired.** "
+                    f"The {PENDING_ACTION_TIMEOUT_SECONDS}s approval window has passed. "
                     "Please request the operation again."
                 ),
             }
 
-        tool_name = action["tool_name"]
-        tool_args = action["tool_args"]
+        tool_name    = action["tool_name"]
+        tool_args    = action["tool_args"]
         execute_tool = EXECUTE_TOOL_MAP.get(tool_name)
 
         if not execute_tool:
@@ -667,20 +790,17 @@ class MCPGroqAgent:
             }
 
         try:
-            # Log approval
-            target = tool_args.get("deployment_name",
-                     tool_args.get("resource_name",
-                     tool_args.get("node_name", "Unknown")))
+            # Derive target / namespace for audit log
+            target = (
+                tool_args.get("deployment_name")
+                or tool_args.get("resource_name")
+                or tool_args.get("node_name")
+                or "Unknown"
+            )
             namespace = tool_args.get("namespace", "cluster")
             log_approval_given(tool_name, target, namespace)
 
-            # Call the execute_ tool on MCP
-            mcp_result = await self._mcp_session.call_tool(execute_tool, tool_args)
-            result_text = ""
-            for content_item in mcp_result.content:
-                if hasattr(content_item, 'text'):
-                    result_text += content_item.text
-
+            result_text = await self._call_mcp_tool(execute_tool, tool_args)
             del self.pending_actions[action_id]
 
             try:
@@ -698,53 +818,57 @@ class MCPGroqAgent:
             self._add_to_history("assistant", msg)
             return {"type": "response", "message": msg}
 
-        except Exception as e:
-            logger.error("execute_approved_action failed: %s", e)
-            del self.pending_actions[action_id]
+        except Exception as exc:
+            logger.error("execute_approved_action failed: %s", exc)
+            # Always clean up — don't leave zombie pending actions
+            self.pending_actions.pop(action_id, None)
             return {
                 "type": "response",
-                "message": f"❌ **Execution error:** {str(e)}",
+                "message": f"❌ **Execution error:** {exc}",
             }
 
     async def cancel_action(self, action_id: str) -> dict:
         """
-        Cancel a pending action.
+        Cancel a pending action (user clicked Cancel / No).
 
-        Args:
-            action_id: UUID of the pending action.
-
-        Returns:
-            Cancellation confirmation dict.
+        Logs the denial and removes the action from pending state.
         """
         if action_id not in self.pending_actions:
             return {
                 "type": "response",
-                "message": "⚠️ **Action not found.** It may have already expired or been processed.",
+                "message": (
+                    "⚠️ **Action not found.** "
+                    "It may have already expired or been processed."
+                ),
             }
 
-        action = self.pending_actions[action_id]
+        action    = self.pending_actions.pop(action_id)
         tool_name = action["tool_name"]
         tool_args = action["tool_args"]
 
-        target = tool_args.get("deployment_name",
-                 tool_args.get("resource_name",
-                 tool_args.get("node_name", "Unknown")))
+        target = (
+            tool_args.get("deployment_name")
+            or tool_args.get("resource_name")
+            or tool_args.get("node_name")
+            or "Unknown"
+        )
         namespace = tool_args.get("namespace", "cluster")
-
         log_approval_denied(tool_name, target, namespace)
-        del self.pending_actions[action_id]
 
-        msg = f"🚫 **Operation cancelled.** The {tool_name} operation on '{target}' was not executed."
+        msg = (
+            f"🚫 **Operation cancelled.**  "
+            f"The `{tool_name}` operation on **{target}** was not executed."
+        )
         self._add_to_history("assistant", msg)
         return {"type": "response", "message": msg}
 
-    def cleanup_expired_actions(self):
-        """Remove any pending actions older than the timeout."""
-        now = time.time()
+    def cleanup_expired_actions(self) -> None:
+        """Evict any pending actions that have passed the timeout."""
+        now     = time.time()
         expired = [
             aid for aid, action in self.pending_actions.items()
             if now - action["timestamp"] > PENDING_ACTION_TIMEOUT_SECONDS
         ]
         for aid in expired:
-            logger.info("Expired pending action: %s", aid)
+            logger.info("Evicting expired pending action %s", aid)
             del self.pending_actions[aid]

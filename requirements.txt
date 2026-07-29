@@ -1,11 +1,28 @@
-mcp[cli]>=1.0.0
+# ────────────────────────────────────────
+# KubeGuardian — Python Dependencies
+# ────────────────────────────────────────
+
+# MCP Server (Model Context Protocol)
+# 1.1.0+ required for streamable HTTP transport
+mcp[cli]>=1.1.0
+
+# Kubernetes client
 kubernetes>=28.1.0
+
+# AWS SDK — both needed, botocore used directly in k8s_client.py
 boto3>=1.34.0
+botocore>=1.34.0
+
+# AI Providers — install all, only the chosen one is used at runtime
 groq>=0.9.0
 anthropic>=0.30.0
-google-generativeai>=0.5.0
+google-genai>=1.0.0
+
+# Web framework + server
 fastapi>=0.110.0
 uvicorn[standard]>=0.30.0
+
+# Utilities
 python-dotenv>=1.0.0
 httpx>=0.27.0
 pydantic>=2.0.0

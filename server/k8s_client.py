@@ -43,42 +43,41 @@ CLUSTER_NAME_HEADER = "x-k8s-aws-id"
 
 def _get_bearer_token(cluster_name: str, region: str) -> str:
     """
-    Generate an EKS-compatible bearer token using a presigned
-    STS GetCallerIdentity URL.  This is the same mechanism used
-    by aws-iam-authenticator, implemented in pure Python.
-
-    Args:
-        cluster_name: Name of the EKS cluster.
-        region:       AWS region.
-
-    Returns:
-        Bearer token string.
+    Generate an EKS-compatible bearer token.
+    Uses the same mechanism as aws-iam-authenticator / aws eks get-token.
     """
-    session = botocore.session.Session()
-    sts_client = session.create_client("sts", region_name=region)
-    service_id = sts_client.meta.service_model.service_id
+    import urllib.parse
+    from botocore.auth import SigV4QueryAuth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+    import botocore.session as bcs
 
-    signer = RequestSigner(service_id, region, "sts",
-                           "v4", session.get_credentials(), session.get_events())
+    # Get credentials from the EC2 instance profile
+    botocore_session = bcs.Session()
+    credentials = botocore_session.get_credentials()
+    credentials = credentials.get_frozen_credentials()
 
-    params = {
-        "method": "GET",
-        "url": f"https://sts.{region}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15",
-        "body": {},
-        "headers": {CLUSTER_NAME_HEADER: cluster_name},
-        "context": {},
-    }
-
-    signed_url = signer.generate_presigned_url(
-        params,
-        region_name=region,
-        expires_in=STS_TOKEN_EXPIRES_IN,
-        operation_name="",
+    # Build the STS URL
+    url = (
+        "https://sts.amazonaws.com/"
+        "?Action=GetCallerIdentity&Version=2011-06-15"
     )
 
-    # Base64-encode the URL and strip padding to form the token
+    # Create request with cluster name header
+    request = AWSRequest(
+        method="GET",
+        url=url,
+        headers={"x-k8s-aws-id": cluster_name},
+    )
+
+    # Sign with SigV4 Query (presigned URL style)
+    signer = SigV4QueryAuth(credentials, "sts", region, expires=STS_TOKEN_EXPIRES_IN)
+    signer.add_auth(request)
+
+    prepared = request.prepare()
+
     token = TOKEN_PREFIX + base64.urlsafe_b64encode(
-        signed_url.encode("utf-8")
+        prepared.url.encode("utf-8")
     ).decode("utf-8").rstrip("=")
 
     return token
